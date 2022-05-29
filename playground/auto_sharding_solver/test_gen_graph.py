@@ -55,8 +55,97 @@ def get_graph(batch_size, input_dim, hidden_dim, output_dim):
         """
     return computation
 
+## hidden_dim should be a list with length = num_layer
+def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, output_dim):
+    assert num_layer >= 1
+    assert num_batch >= 1
+    assert len(hidden_dim) >= 1
+    assert len(hidden_dim) == num_layer
+
+    computation = HloComputation()
+    with computation:
+        ## x, y and w
+        x = [None] * num_batch
+        y = [None] * num_batch
+        for i in range(num_batch):
+            x[i] = HloParameter((batch_size, input_dim))
+            y[i] = HloParameter((batch_size, output_dim))
+        w = [None] * (num_layer + 1) # the last one for output y'
+        for i in range(num_layer):
+            if i == 0:
+                w[i] = HloParameter((input_dim, hidden_dim[i]))
+            else:
+                w[i] = HloParameter((hidden_dim[i - 1], hidden_dim[i]))
+        w[num_layer] = HloParameter((hidden_dim[num_layer - 1], output_dim))
+
+        h = [[None] * (num_layer + 1)] * num_batch
+        loss = [None] * num_batch
+        grad_loss = [None] * num_batch
+        grad_h = [[None] * (num_layer + 1)] * num_batch
+        grad_w = [[None] * (num_layer + 1)] * num_batch
+        for batch in range(num_batch):
+            ## forward
+            for layer in range(num_layer + 1):
+                if layer == 0:
+                    h[batch][layer] = HloDot(x[batch], w[layer])
+                else:
+                    h[batch][layer] = HloDot(h[batch][layer - 1], w[layer])
+            assert h[batch][num_layer].shape == y[batch].shape
+            loss[batch] = HloSubtract(h[batch][num_layer], y[batch])
+    
+            ## backward
+            coef = HloConstant(2 / batch_size / output_dim)
+            coef = HloBroadcast(coef, (batch_size, output_dim))
+            grad_loss[batch] = HloMutiply(loss[batch], coef)
+    
+            for layer in reversed(range(num_layer + 1)):
+                if layer == num_layer:
+                    grad_h[batch][layer] = grad_loss[batch]
+                else:
+                    grad_h[batch][layer] = HloDot(grad_h[batch][layer + 1], w[layer + 1],
+                                                  lhs_contracting_dims=(1,),
+                                                  rhs_contracting_dims=(1,),)
+                if layer == 0:
+                    grad_w[batch][layer] = HloDot(x[batch], grad_h[batch][layer],
+                                                  lhs_contracting_dims=(0,),
+                                                  rhs_contracting_dims=(0,),)
+                else:
+                    grad_w[batch][layer] = HloDot(h[batch][layer - 1], grad_h[batch][layer],
+                                                  lhs_contracting_dims=(0,),
+                                                  rhs_contracting_dims=(0,),)
+
+        ## sum up grad_w
+        if num_batch > 1:
+            grad_w_sum = [[None] * (num_layer + 1)] * (num_batch - 1)
+            grad_w_avg = [None] * (num_layer + 1)
+            for layer in range(num_layer + 1):
+                for batch in range(num_batch - 1):
+                    if batch == 0:
+                        grad_w_sum[batch][layer] = HloAdd(grad_w[batch][layer], grad_w[batch + 1][layer])
+                    else:
+                        grad_w_sum[batch][layer] = HloAdd(grad_w_sum[batch - 1][layer], grad_w[batch + 1][layer])
+                coef = HloConstant(1 / num_batch)
+                coef = HloBroadcast(coef, grad_w_sum[num_batch - 2][layer].shape)
+                grad_w_avg[layer] = HloMutiply(grad_w_sum[num_batch - 2][layer], coef)
+ 
+        new_w = [None] * (num_layer + 1)
+        for layer in range(num_layer + 1):
+            if num_batch == 1:
+                new_w[layer] = HloSubtract(w[layer], grad_w[0][layer])
+            else:
+                new_w[layer] = HloSubtract(w[layer], grad_w_avg[layer])
+
+        out = HloTuple(tuple(new_w))
+
+        ## alias
+        computation.set_alias([(w[i], new_w[i]) for i in range(num_layer + 1)])
+
+    return computation
+
 
 if __name__ == "__main__":
-    graph = get_graph(64, 256, 256, 256)
+#    graph = get_graph(64, 256, 256, 256)
+    graph = get_graph_naive(num_layer=2, num_batch=2, batch_size=64, \
+                            input_dim=256, hidden_dim=[256, 256], output_dim=256)
     print(graph)
 
