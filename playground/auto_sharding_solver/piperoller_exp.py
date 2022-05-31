@@ -196,8 +196,24 @@ def call_ilp(graph, args):
             "Cannot run the function under the given memory budget. "
             "Please increase the memory budget.")
 
-    return objective, status
+    partition = [None] * max_subgraphs
+    for subgraph in range(max_subgraphs):
+        partition[subgraph] = []
+        for i in range(num_nodes):
+            if pulp.value(x[i][subgraph]) == 1:
+                partition[subgraph].append(i)
+    assert np.sum([len(lst) for lst in partition]) == num_nodes
+        
+    return objective, status, partition
  
+def print_placement(partition, num_device):
+    assert len(partition) % num_device == 0
+    num_subgraph = len(partition) // num_device
+    for device in range(num_device):
+        print('device', device)
+        for subgraph in range(num_subgraph):
+            print(f'subgraph {subgraph}: {partition[num_subgraph * device + subgraph]}')
+
 
 if __name__ == "__main__":
 #    graph = get_graph_demo(64, 256, 256, 256)
@@ -205,5 +221,6 @@ if __name__ == "__main__":
                             input_dim=256, hidden_dim=[256, 256], output_dim=256)
     print(graph)
     args = {'maxDevices': 4, 'maxSubgraphsPerDevice': 2, 'maxSizePerDevice': 1000000}
-    objective, status = call_ilp(graph, args)
+    objective, status, partition = call_ilp(graph, args)
+    print_placement(partition, args['maxDevices'])
 
