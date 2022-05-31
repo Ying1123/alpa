@@ -179,12 +179,12 @@ def call_ilp(graph, args):
     # 4. Subgraph start, finish
     start = LpVariable.dicts('SubgraphStart', (range(max_subgraphs)), 0, None, LpInteger)
     finish = LpVariable.dicts('SubgraphFinish', (range(max_subgraphs)), 0, None, LpInteger)
-    # TODO unfinish
+    # 5. TotalLatency that we are minimizing
+    total_latency = LpVariable('TotalLatency', None, None, LpInteger)
 
     ## objective
     prob = LpProblem("NaiveFormulation", LpMinimize)
-    prob += lpSum([x[0][subgraph] for subgraph in range(max_subgraphs)]) # temporary
-    # TODO unfinish
+    prob += total_latency
 
     ## constraints
     # 1. schedule every node on exactly one subgraph
@@ -224,8 +224,23 @@ def call_ilp(graph, args):
             load.append(get_comm_cost(node) * comm_in[node.index][subgraph])
             load.append(get_comm_cost(node) * comm_out[node.index][subgraph])
         prob += (finish[subgraph] == start[subgraph] + lpSum(load))
-
-    # TODO unfinish
+    # 6. Latency for nodes on a subgraph
+    for subgraph in range(max_subgraphs):
+        for node_id in range(num_nodes):
+            # quadratic constraint!
+            # model.addConstr(latency[node_id] >= x[node_id][subgraph] * finish[subgraph])
+            # rewrite it like so:
+            prob += (latency[node_id] >= finish[subgraph]
+                     - (1 - x[node_id][subgraph]) * latencyUpperBound)
+    # 7. ordering of subgraphs assigned to the same device
+    for device in range(args['maxDevices']):
+        l = args['maxSubgraphsPerDevice'] * device
+        r = l + args['maxSubgraphsPerDevice']
+        for subgraph in range(l + 1, r):
+            prob += (start[subgraph] >= finish[subgraph - 1])
+    # 8. TotalLatency that we are minimizing
+    for node_id in range(num_nodes):
+        prob += (total_latency >= latency[node_id])
 
     ## send to solver
     time_limit = 600
@@ -272,7 +287,7 @@ if __name__ == "__main__":
     graph = get_graph_naive(num_layer=1, num_batch=2, batch_size=64, \
                             input_dim=256, hidden_dim=[256], output_dim=256)
     print(graph)
-    args = {'maxDevices': 4, 'maxSubgraphsPerDevice': 2, 'maxSizePerDevice': 1000000}
+    args = {'maxDevices': 1, 'maxSubgraphsPerDevice': 1, 'maxSizePerDevice': 1000000}
     objective, status, partition = call_ilp(graph, args)
     print_placement(partition, args['maxDevices'])
 
