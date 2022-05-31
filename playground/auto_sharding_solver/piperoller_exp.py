@@ -3,6 +3,9 @@ import multiprocessing
 
 from hlo import *
 
+FLOP_PER_SECOND = 1000
+IO_PER_SECOND = 1000
+
 def get_graph_demo(batch_size, input_dim, hidden_dim, output_dim):
     computation = HloComputation()
     with computation:
@@ -145,22 +148,37 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
 
     return computation
 
+def get_latency(node):
+    return node.get_flop_count() // FLOP_PER_SECOND
+
+def get_comm_cost(node):
+    return np.prod(node.shape) // IO_PER_SECOND
 
 def call_ilp(graph, args):
     import pulp
-    from pulp import LpVariable, LpProblem, LpMinimize, lpSum, lpDot, LpStatus
+    from pulp import LpVariable, LpProblem, LpMinimize, lpSum, lpDot, LpStatus, LpInteger
 
     tic = time.time()
 
-    ## initialization
-    node_id = {}
-    for i, node in enumerate(graph.instructions):
-        node_id[node] = i
+    ## initialization & preprocessing
     num_nodes = len(graph.instructions)
     max_subgraphs = args['maxDevices'] * args['maxSubgraphsPerDevice']
+    # compute latencyUpperBound
+    latencyUpperBound = 0
+    for node in graph.instructions:
+        latencyUpperBound += get_latency(node)
 
     ## create variables
+    # 1. Indicator for the placement of each node
     x = LpVariable.dicts('Indicator', (range(num_nodes), range(max_subgraphs)), cat='Binary')
+    # 2. CommIn, CommOut
+    comm_in = LpVariable.dicts('CommIn', (range(num_nodes), range(max_subgraphs)), 0, None, LpInteger)
+    comm_out = LpVariable.dicts('CommOut', (range(num_nodes), range(max_subgraphs)), 0, None, LpInteger)
+    # 3. Latency
+    latency = LpVariable.dicts('Latency', (range(num_nodes)), 0, None, LpInteger)
+    # 4. Subgraph start, finish
+    start = LpVariable.dicts('SubgraphStart', (range(max_subgraphs)), 0, None, LpInteger)
+    finish = LpVariable.dicts('SubgraphFinish', (range(max_subgraphs)), 0, None, LpInteger)
     # TODO unfinish
 
     ## objective
@@ -169,8 +187,44 @@ def call_ilp(graph, args):
     # TODO unfinish
 
     ## constraints
+    # 1. schedule every node on exactly one subgraph
     for i in range(num_nodes):
         prob += lpSum([x[i][subgraph] for subgraph in range(max_subgraphs)]) == 1
+    # 2. total size of nodes on one device cannot exceed its size capability
+    for device in range(args['maxDevices']):
+        l = args['maxSubgraphsPerDevice'] * device
+        r = l + args['maxSubgraphsPerDevice']
+        size = []
+        for subgraph in range(l, r):
+            for node in graph.instructions:
+                size.append(np.prod(node.shape) * x[node.index][subgraph])
+        prob += lpSum(size) <= args['maxSizePerDevice']
+    # 3. CommIn, CommOut
+    for subgraph in range(max_subgraphs):
+        for edge in graph.get_edge_set():
+            source = edge[0]
+            dest = edge[1]
+            prob += (comm_in[source][subgraph] >= x[dest][subgraph] - x[source][subgraph])
+            prob += (comm_out[source][subgraph] >= x[source][subgraph] - x[dest][subgraph])
+    # 4. subgraph can't start before the incoming results are ready  
+    for subgraph in range(max_subgraphs):
+        for node_id in range(num_nodes):
+            # quadratic constraint!
+            # model.addConstr(start[subgraph] >= latency[node_id] * comm_in[node_id, subgraph])
+            # rewrite it like so:
+            prob += (start[subgraph] >= latency[node_id]
+                     - (1 - comm_in[node_id][subgraph]) * latencyUpperBound)
+    # 5. finish time of a subgraph
+    for subgraph in range(max_subgraphs):                                                                        
+        load = []
+        for node in graph.instructions:
+            load.append(get_latency(node) * x[node.index][subgraph])
+            # model with "calls": communication NOT overlapped with compute
+            # so we add communication here
+            load.append(get_comm_cost(node) * comm_in[node.index][subgraph])
+            load.append(get_comm_cost(node) * comm_out[node.index][subgraph])
+        prob += (finish[subgraph] == start[subgraph] + lpSum(load))
+
     # TODO unfinish
 
     ## send to solver
@@ -192,9 +246,7 @@ def call_ilp(graph, args):
           f"Time: {time.time() - tic}")
 
     if prob.status in [pulp.LpStatusInfeasible]:
-        raise RuntimeError(
-            "Cannot run the function under the given memory budget. "
-            "Please increase the memory budget.")
+        raise RuntimeError("Cannot run find any feasible solutions.")
 
     partition = [None] * max_subgraphs
     for subgraph in range(max_subgraphs):
@@ -217,8 +269,8 @@ def print_placement(partition, num_device):
 
 if __name__ == "__main__":
 #    graph = get_graph_demo(64, 256, 256, 256)
-    graph = get_graph_naive(num_layer=2, num_batch=2, batch_size=64, \
-                            input_dim=256, hidden_dim=[256, 256], output_dim=256)
+    graph = get_graph_naive(num_layer=1, num_batch=2, batch_size=64, \
+                            input_dim=256, hidden_dim=[256], output_dim=256)
     print(graph)
     args = {'maxDevices': 4, 'maxSubgraphsPerDevice': 2, 'maxSizePerDevice': 1000000}
     objective, status, partition = call_ilp(graph, args)

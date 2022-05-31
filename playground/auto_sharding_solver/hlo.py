@@ -318,6 +318,9 @@ class HloInstruction:
     def propagate_batch_dim(self, operand):
         raise NotImplementedError(f"{self.op_code}")
 
+    def get_flop_count(self):
+        return 0
+
 
 class HloParameter(HloInstruction):
     def __init__(self, shape, fix_strategy=None):
@@ -496,6 +499,9 @@ class HloElementwise(HloInstruction):
     def propagate_batch_dim(self, ins):
         self.batch_dim = ins.batch_dim
         return True
+
+    def get_flop_count(self):
+        return np.prod(self.shape)
 
     def __str__(self):
         fun_name = str(self.op_code)[7:].lower()
@@ -852,6 +858,9 @@ class HloDot(HloInstruction):
             if operand.batch_dim in self.rhs_contracting_dims:
                 return False
 
+    def get_flop_count(self):
+        return 2 * np.prod(self.shape) * np.prod([self.lhs.shape[d] for d in self.lhs_contracting_dims])
+
     def __str__(self):
         return f"{self.name} {self.shape} = dot({self.lhs.name}, {self.rhs.name}) "\
                f" lhs_con_dim={self.lhs_contracting_dims},"\
@@ -1083,6 +1092,13 @@ class HloComputation:
             self.alias_cost_vector.append(cost_vector)
 
         self.strategy_built = True
+
+    def get_edge_set(self):
+        E = []
+        for ins in self.instructions:
+            for operand in ins.operands:
+                E.append((operand.index, ins.index))
+        return E
 
     def __enter__(self):
         assert HloComputation.cur_env is None
