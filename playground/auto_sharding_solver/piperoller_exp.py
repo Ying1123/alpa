@@ -3,8 +3,8 @@ import multiprocessing
 
 from hlo import *
 
-FLOP_PER_SECOND = 1000
-IO_PER_SECOND = 1000
+FLOP_PER_SECOND = 10
+IO_PER_SECOND = 1000000
 
 def get_graph_demo(batch_size, input_dim, hidden_dim, output_dim):
     computation = HloComputation()
@@ -84,11 +84,11 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
                 w[i] = HloParameter((hidden_dim[i - 1], hidden_dim[i]))
         w[num_layer] = HloParameter((hidden_dim[num_layer - 1], output_dim))
 
-        h = [[None] * (num_layer + 1)] * num_batch
+        h = [[None for i in range(num_layer + 1)] for j in range(num_batch)]
         loss = [None] * num_batch
         grad_loss = [None] * num_batch
-        grad_h = [[None] * (num_layer + 1)] * num_batch
-        grad_w = [[None] * (num_layer + 1)] * num_batch
+        grad_h = [[None for i in range(num_layer + 1)] for j in range(num_batch)]
+        grad_w = [[None for i in range(num_layer + 1)] for j in range(num_batch)]
         for batch in range(num_batch):
             ## forward
             for layer in range(num_layer + 1):
@@ -122,7 +122,7 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
 
         ## sum up grad_w
         if num_batch > 1:
-            grad_w_sum = [[None] * (num_layer + 1)] * (num_batch - 1)
+            grad_w_sum = [[None for i in range(num_layer + 1)] for j in range(num_batch - 1)]
             grad_w_avg = [None] * (num_layer + 1)
             for layer in range(num_layer + 1):
                 for batch in range(num_batch - 1):
@@ -156,31 +156,33 @@ def get_comm_cost(node):
 
 def call_ilp(graph, args):
     import pulp
-    from pulp import LpVariable, LpProblem, LpMinimize, lpSum, lpDot, LpStatus, LpInteger
+    from pulp import LpVariable, LpProblem, LpMinimize, lpSum, lpDot, LpStatus, LpContinuous
 
     tic = time.time()
 
     ## initialization & preprocessing
-    num_nodes = len(graph.instructions)
+    num_nodes = len(graph.instructions) - 1
     max_subgraphs = args['maxDevices'] * args['maxSubgraphsPerDevice']
     # compute latencyUpperBound
     latencyUpperBound = 0
-    for node in graph.instructions:
-        latencyUpperBound += get_latency(node)
+    for node in graph.instructions[:-1]:
+        latencyUpperBound += get_latency(node) + get_comm_cost(node) * num_nodes
+    assert latencyUpperBound < 1e9
+#    print('latencyUpperBound', latencyUpperBound)
 
     ## create variables
     # 1. Indicator for the placement of each node
     x = LpVariable.dicts('Indicator', (range(num_nodes), range(max_subgraphs)), cat='Binary')
     # 2. CommIn, CommOut
-    comm_in = LpVariable.dicts('CommIn', (range(num_nodes), range(max_subgraphs)), 0, None, LpInteger)
-    comm_out = LpVariable.dicts('CommOut', (range(num_nodes), range(max_subgraphs)), 0, None, LpInteger)
+    comm_in = LpVariable.dicts('CommIn', (range(num_nodes), range(max_subgraphs)), 0, None, LpContinuous)
+    comm_out = LpVariable.dicts('CommOut', (range(num_nodes), range(max_subgraphs)), 0, None, LpContinuous)
     # 3. Latency
-    latency = LpVariable.dicts('Latency', (range(num_nodes)), 0, None, LpInteger)
+    latency = LpVariable.dicts('Latency', (range(num_nodes)), 0, None, LpContinuous)
     # 4. Subgraph start, finish
-    start = LpVariable.dicts('SubgraphStart', (range(max_subgraphs)), 0, None, LpInteger)
-    finish = LpVariable.dicts('SubgraphFinish', (range(max_subgraphs)), 0, None, LpInteger)
+    start = LpVariable.dicts('SubgraphStart', (range(max_subgraphs)), 0, None, LpContinuous)
+    finish = LpVariable.dicts('SubgraphFinish', (range(max_subgraphs)), 0, None, LpContinuous)
     # 5. TotalLatency that we are minimizing
-    total_latency = LpVariable('TotalLatency', None, None, LpInteger)
+    total_latency = LpVariable('TotalLatency', 0, None, LpContinuous)
 
     ## objective
     prob = LpProblem("NaiveFormulation", LpMinimize)
@@ -196,8 +198,12 @@ def call_ilp(graph, args):
         r = l + args['maxSubgraphsPerDevice']
         size = []
         for subgraph in range(l, r):
-            for node in graph.instructions:
-                size.append(np.prod(node.shape) * x[node.index][subgraph])
+            for node in graph.instructions[:-1]:
+                if isinstance(node, HloParameter):
+                    tmp_size = np.prod(node.shape)
+                else:
+                    tmp_size = 0
+                size.append(tmp_size * x[node.index][subgraph])
         prob += lpSum(size) <= args['maxSizePerDevice']
     # 3. CommIn, CommOut
     for subgraph in range(max_subgraphs):
@@ -215,9 +221,9 @@ def call_ilp(graph, args):
             prob += (start[subgraph] >= latency[node_id]
                      - (1 - comm_in[node_id][subgraph]) * latencyUpperBound)
     # 5. finish time of a subgraph
-    for subgraph in range(max_subgraphs):                                                                        
+    for subgraph in range(max_subgraphs):
         load = []
-        for node in graph.instructions:
+        for node in graph.instructions[:-1]:
             load.append(get_latency(node) * x[node.index][subgraph])
             # model with "calls": communication NOT overlapped with compute
             # so we add communication here
@@ -243,7 +249,7 @@ def call_ilp(graph, args):
         prob += (total_latency >= latency[node_id])
 
     ## send to solver
-    time_limit = 600
+    time_limit = 60
     assert "COIN_CMD" in pulp.listSolvers(onlyAvailable=True), (
         "Please install ILP solvers by 'sudo apt install coinor-cbc'"
     )
@@ -266,10 +272,18 @@ def call_ilp(graph, args):
     partition = [None] * max_subgraphs
     for subgraph in range(max_subgraphs):
         partition[subgraph] = []
-        for i in range(num_nodes):
-            if pulp.value(x[i][subgraph]) == 1:
-                partition[subgraph].append(i)
-    assert np.sum([len(lst) for lst in partition]) == num_nodes
+        for node in graph.instructions[:-1]:
+            if pulp.value(x[node.index][subgraph]) == 1:
+                partition[subgraph].append(node.name)
+#    assert np.sum([len(lst) for lst in partition]) == num_nodes
+
+    # print start and finish time of each subgraph
+    for subgraph in range(max_subgraphs):
+        print(f'subgraph {subgraph} start {pulp.value(start[subgraph])} \
+                finish {pulp.value(finish[subgraph])}')
+
+    for node in graph.instructions[:-1]:
+        print(node.name, 'latency', pulp.value(latency[node.index]))
         
     return objective, status, partition
  
@@ -284,10 +298,13 @@ def print_placement(partition, num_device):
 
 if __name__ == "__main__":
 #    graph = get_graph_demo(64, 256, 256, 256)
-    graph = get_graph_naive(num_layer=1, num_batch=2, batch_size=64, \
-                            input_dim=256, hidden_dim=[256], output_dim=256)
+    num_layer = 2 - 1
+    hidden_dim = [1024] * num_layer
+    graph = get_graph_naive(num_layer=num_layer, num_batch=2, batch_size=4, \
+                            input_dim=1024, hidden_dim=hidden_dim, output_dim=1024)
     print(graph)
-    args = {'maxDevices': 1, 'maxSubgraphsPerDevice': 1, 'maxSizePerDevice': 1000000}
+    args = {'maxDevices': 3, 'maxSubgraphsPerDevice': 2,
+            'maxSizePerDevice': 1024 * 1024 * 1 + 4 * 1024 * 4 + 1000}
     objective, status, partition = call_ilp(graph, args)
     print_placement(partition, args['maxDevices'])
 

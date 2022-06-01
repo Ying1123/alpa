@@ -1095,7 +1095,7 @@ class HloComputation:
 
     def get_edge_set(self):
         E = []
-        for ins in self.instructions:
+        for ins in self.instructions[:-1]:
             for operand in ins.operands:
                 E.append((operand.index, ins.index))
         return E
