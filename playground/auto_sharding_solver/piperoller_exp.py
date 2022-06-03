@@ -1,5 +1,8 @@
+from collections import defaultdict
 import time
 import multiprocessing
+
+import graphviz
 
 from hlo import *
 
@@ -74,15 +77,15 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
         x = [None] * num_batch
         y = [None] * num_batch
         for i in range(num_batch):
-            x[i] = HloParameter((batch_size, input_dim))
-            y[i] = HloParameter((batch_size, output_dim))
+            x[i] = HloParameter((batch_size, input_dim), name=f"B{i}_x")
+            y[i] = HloParameter((batch_size, output_dim), name=f"B{i}_y")
         w = [None] * (num_layer + 1) # the last one for output y'
         for i in range(num_layer):
             if i == 0:
-                w[i] = HloParameter((input_dim, hidden_dim[i]))
+                w[i] = HloParameter((input_dim, hidden_dim[i]), name=f"w_{i}")
             else:
-                w[i] = HloParameter((hidden_dim[i - 1], hidden_dim[i]))
-        w[num_layer] = HloParameter((hidden_dim[num_layer - 1], output_dim))
+                w[i] = HloParameter((hidden_dim[i - 1], hidden_dim[i]), name=f"w_{i}")
+        w[num_layer] = HloParameter((hidden_dim[num_layer - 1], output_dim), name=f"w_{num_layer}")
 
         h = [[None for i in range(num_layer + 1)] for j in range(num_batch)]
         loss = [None] * num_batch
@@ -93,16 +96,16 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
             ## forward
             for layer in range(num_layer + 1):
                 if layer == 0:
-                    h[batch][layer] = HloDot(x[batch], w[layer])
+                    h[batch][layer] = HloDot(x[batch], w[layer], name=f"B{batch}_h_{layer}")
                 else:
-                    h[batch][layer] = HloDot(h[batch][layer - 1], w[layer])
+                    h[batch][layer] = HloDot(h[batch][layer - 1], w[layer], name=f"B{batch}_h_{layer}")
             assert h[batch][num_layer].shape == y[batch].shape
-            loss[batch] = HloSubtract(h[batch][num_layer], y[batch])
+            loss[batch] = HloSubtract(h[batch][num_layer], y[batch], name=f"B{batch}_loss")
     
             ## backward
             coef = HloConstant(2 / batch_size / output_dim)
             coef = HloBroadcast(coef, (batch_size, output_dim))
-            grad_loss[batch] = HloMutiply(loss[batch], coef)
+            grad_loss[batch] = HloMutiply(loss[batch], coef, name=f"B{batch}_dloss")
     
             for layer in reversed(range(num_layer + 1)):
                 if layer == num_layer:
@@ -110,15 +113,18 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
                 else:
                     grad_h[batch][layer] = HloDot(grad_h[batch][layer + 1], w[layer + 1],
                                                   lhs_contracting_dims=(1,),
-                                                  rhs_contracting_dims=(1,),)
+                                                  rhs_contracting_dims=(1,),
+                                                  name=f"B{batch}_dh_{layer}")
                 if layer == 0:
                     grad_w[batch][layer] = HloDot(x[batch], grad_h[batch][layer],
                                                   lhs_contracting_dims=(0,),
-                                                  rhs_contracting_dims=(0,),)
+                                                  rhs_contracting_dims=(0,),
+                                                  name=f"B{batch}_dw_{layer}")
                 else:
                     grad_w[batch][layer] = HloDot(h[batch][layer - 1], grad_h[batch][layer],
                                                   lhs_contracting_dims=(0,),
-                                                  rhs_contracting_dims=(0,),)
+                                                  rhs_contracting_dims=(0,),
+                                                  name=f"B{batch}_dw_{layer}")
 
         ## sum up grad_w
         if num_batch > 1:
@@ -132,14 +138,14 @@ def get_graph_naive(num_layer, num_batch, batch_size, input_dim, hidden_dim, out
                         grad_w_sum[batch][layer] = HloAdd(grad_w_sum[batch - 1][layer], grad_w[batch + 1][layer])
                 coef = HloConstant(1 / num_batch)
                 coef = HloBroadcast(coef, grad_w_sum[num_batch - 2][layer].shape)
-                grad_w_avg[layer] = HloMutiply(grad_w_sum[num_batch - 2][layer], coef)
+                grad_w_avg[layer] = HloMutiply(grad_w_sum[num_batch - 2][layer], coef, name=f"dw_{layer}")
  
         new_w = [None] * (num_layer + 1)
         for layer in range(num_layer + 1):
             if num_batch == 1:
-                new_w[layer] = HloSubtract(w[layer], grad_w[0][layer])
+                new_w[layer] = HloSubtract(w[layer], grad_w[0][layer], name=f"new_w_{layer}")
             else:
-                new_w[layer] = HloSubtract(w[layer], grad_w_avg[layer])
+                new_w[layer] = HloSubtract(w[layer], grad_w_avg[layer], name=f"new_w_{layer}")
 
         out = HloTuple(tuple(new_w))
 
@@ -274,7 +280,7 @@ def call_ilp(graph, args):
         partition[subgraph] = []
         for node in graph.instructions[:-1]:
             if pulp.value(x[node.index][subgraph]) == 1:
-                partition[subgraph].append(node.name)
+                partition[subgraph].append(node.index)
 #    assert np.sum([len(lst) for lst in partition]) == num_nodes
 
     # print start and finish time of each subgraph
@@ -295,16 +301,46 @@ def print_placement(partition, num_device):
         for subgraph in range(num_subgraph):
             print(f'subgraph {subgraph}: {partition[num_subgraph * device + subgraph]}')
 
+colors = ["green", "blue", "red", "gray", "pink", "yellow"]
+
+def visualize(graph, partition):
+    g = graphviz.Digraph("hlo_graph")
+
+    group_by_batch = defaultdict(list)
+    ins_id_to_partition_id = {}
+
+    for partition_id in range(len(partition)):
+        for ins_id in partition[partition_id]:
+            ins_id_to_partition_id[ins_id] = partition_id
+
+    for i, ins in enumerate(graph.instructions[:-1]):
+        if ins.name[0] == "B":
+            batch_id = int(ins.name.split("_")[0][1:])
+            group_by_batch[batch_id].append(i)
+        else:
+            g.node(str(i), ins.name, color=colors[ins_id_to_partition_id[i]])
+
+    for batch_id, ins_ids in group_by_batch.items():
+        with g.subgraph(name=f'cluster_{batch_id}') as c:
+            c.attr(label=f'batch {batch_id}')
+            for i in ins_ids:
+                name = graph.instructions[i].name
+                c.node(str(i), name[name.index("_")+1:], color=colors[ins_id_to_partition_id[i]])
+
+    for (src, dst) in graph.get_edge_set():
+        g.edge(str(src), str(dst))
+
+    g.render(directory='.')
+
 
 if __name__ == "__main__":
-#    graph = get_graph_demo(64, 256, 256, 256)
     num_layer = 2 - 1
     hidden_dim = [1024] * num_layer
     graph = get_graph_naive(num_layer=num_layer, num_batch=2, batch_size=4, \
                             input_dim=1024, hidden_dim=hidden_dim, output_dim=1024)
     print(graph)
+
     args = {'maxDevices': 3, 'maxSubgraphsPerDevice': 2,
             'maxSizePerDevice': 1024 * 1024 * 1 + 4 * 1024 * 4 + 1000}
     objective, status, partition = call_ilp(graph, args)
-    print_placement(partition, args['maxDevices'])
-
+    visualize(graph, partition)

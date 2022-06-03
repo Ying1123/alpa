@@ -291,12 +291,12 @@ op_code_ct = defaultdict(int)
 
 
 class HloInstruction:
-    def __init__(self, op_code, shape, operands=[]):
+    def __init__(self, op_code, shape, operands=[], name=None):
         # Attributes
         self.op_code = op_code
         self.shape = shape
         self.operands = operands
-        self.name = f"{str(op_code)[7:].lower()}.{op_code_ct[op_code]}"
+        self.name = name or f"{str(op_code)[7:].lower()}.{op_code_ct[op_code]}"
         op_code_ct[op_code] += 1
 
         # Cost
@@ -323,8 +323,8 @@ class HloInstruction:
 
 
 class HloParameter(HloInstruction):
-    def __init__(self, shape, fix_strategy=None):
-        super().__init__(OpCode.PARAMETER, shape, [])
+    def __init__(self, shape, fix_strategy=None, name=None):
+        super().__init__(OpCode.PARAMETER, shape, [], name)
         self.fix_strategy = fix_strategy
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -370,8 +370,8 @@ class HloParameter(HloInstruction):
 
 
 class HloConstant(HloInstruction):
-    def __init__(self, value):
-        super().__init__(OpCode.CONSTANT, (), [])
+    def __init__(self, value, name=None):
+        super().__init__(OpCode.CONSTANT, (), [], name)
         self.value = value
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -385,10 +385,10 @@ class HloConstant(HloInstruction):
 
 
 class HloBroadcast(HloInstruction):
-    def __init__(self, operand, shape, dimensions=()):
+    def __init__(self, operand, shape, dimensions=(), name=None):
         for i in dimensions:
             assert shape[i] == operand.shape[dimensions.index(i)]
-        super().__init__(OpCode.BROADCAST, shape, [operand])
+        super().__init__(OpCode.BROADCAST, shape, [operand], name)
         self.dimensions = dimensions
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -410,10 +410,10 @@ class HloBroadcast(HloInstruction):
 
 
 class HloReshape(HloInstruction):
-    def __init__(self, operand, new_shape):
+    def __init__(self, operand, new_shape, name=None):
         # todo: mark this as inplace
         assert np.prod(operand.shape) == np.prod(new_shape)
-        super().__init__(OpCode.RESHAPE, new_shape, [operand])
+        super().__init__(OpCode.RESHAPE, new_shape, [operand], name)
         self.new_shape = new_shape
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -443,7 +443,7 @@ class HloTranspose(HloInstruction):
     def __init__(self, operand, dimensions):
         assert len(dimensions) == len(operand.shape)
         new_shape = tuple(operand.shape[i] for i in dimensions)
-        super().__init__(OpCode.TRANSPOSE, new_shape, [operand])
+        super().__init__(OpCode.TRANSPOSE, new_shape, [operand], name)
         self.dimensions = dimensions
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -465,10 +465,10 @@ class HloTranspose(HloInstruction):
 
 
 class HloElementwise(HloInstruction):
-    def __init__(self, op_code, operands):
+    def __init__(self, op_code, operands, name=None):
         for i in range(0, len(operands)):
             assert operands[0].shape == operands[i].shape
-        super().__init__(op_code, operands[0].shape, operands)
+        super().__init__(op_code, operands[0].shape, operands, name)
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
         depths = [operand.depth for operand in self.operands]
@@ -536,39 +536,39 @@ class HloForceReplicated(HloElementwise):
 
 
 class HloAdd(HloElementwise):
-    def __init__(self, lhs, rhs):
-        super().__init__(OpCode.ADD, [lhs, rhs])
+    def __init__(self, lhs, rhs, name=None):
+        super().__init__(OpCode.ADD, [lhs, rhs], name)
 
 
 class HloSubtract(HloElementwise):
-    def __init__(self, lhs, rhs):
-        super().__init__(OpCode.SUBTRACT, [lhs, rhs])
+    def __init__(self, lhs, rhs, name=None):
+        super().__init__(OpCode.SUBTRACT, [lhs, rhs], name)
 
 
 class HloMutiply(HloElementwise):
-    def __init__(self, lhs, rhs):
-        super().__init__(OpCode.MULTIPLY, [lhs, rhs])
+    def __init__(self, lhs, rhs, name=None):
+        super().__init__(OpCode.MULTIPLY, [lhs, rhs], name)
 
 
 class HloDiv(HloElementwise):
-    def __init__(self, lhs, rhs):
-        super().__init__(OpCode.DIV, [lhs, rhs])
+    def __init__(self, lhs, rhs, name=None):
+        super().__init__(OpCode.DIV, [lhs, rhs], name)
 
 
 class HloCompare(HloElementwise):
-    def __init__(self, lhs, rhs):
-        super().__init__(OpCode.COMPARE, [lhs, rhs])
+    def __init__(self, lhs, rhs, name=None):
+        super().__init__(OpCode.COMPARE, [lhs, rhs], name)
 
 
 class HloSelect(HloElementwise):
-    def __init__(self, pred, true_value, false_value):
-        super().__init__(OpCode.SELECT, [pred, true_value, false_value])
+    def __init__(self, pred, true_value, false_value, name=None):
+        super().__init__(OpCode.SELECT, [pred, true_value, false_value], name)
 
 
 class HloReduce(HloInstruction):
-    def __init__(self, operand, dimensions):
+    def __init__(self, operand, dimensions, name=None):
         new_shape = tuple(operand.shape[i] for i in range(len(operand.shape)) if i not in dimensions)
-        super().__init__(OpCode.REDUCE, new_shape, [operand])
+        super().__init__(OpCode.REDUCE, new_shape, [operand], name)
         self.dimensions = dimensions
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
@@ -636,7 +636,8 @@ class HloReduce(HloInstruction):
 class HloDot(HloInstruction):
     def __init__(self, lhs, rhs,
                  lhs_batch_dims=(), lhs_contracting_dims=(1,),
-                 rhs_batch_dims=(), rhs_contracting_dims=(0,)):
+                 rhs_batch_dims=(), rhs_contracting_dims=(0,),
+                 name=None):
         # shape inference
         lhs_space_shape = \
             tuple(lhs.shape[i] for i in range(len(lhs.shape))
@@ -653,7 +654,7 @@ class HloDot(HloInstruction):
         for i, j in zip(lhs_batch_dims, rhs_batch_dims):
             assert lhs.shape[i] == rhs.shape[j]
 
-        super().__init__(OpCode.DOT, shape, [lhs, rhs])
+        super().__init__(OpCode.DOT, shape, [lhs, rhs], name)
         self.lhs = lhs
         self.lhs_batch_dims = lhs_batch_dims
         self.lhs_contracting_dims = lhs_contracting_dims
@@ -868,8 +869,8 @@ class HloDot(HloInstruction):
 
 
 class HloTuple(HloInstruction):
-    def __init__(self, operands):
-        super().__init__(OpCode.TUPLE, (), operands)
+    def __init__(self, operands, name=None):
+        super().__init__(OpCode.TUPLE, (), operands, name)
 
     def build_strategy_and_cost(self, cluster_env, solver_option):
         self.strategies.append(InstructionStrategy("tuple", ShardingSpec.tuple()))
